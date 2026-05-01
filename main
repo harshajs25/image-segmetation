@@ -1,0 +1,401 @@
+# ============================================================
+#  ROAD EXTRACTION — DeepGlobe — D-LinkNet34 — FINAL
+#  One-shot best version. No experimentation needed.
+#
+#  Setup: 1) Upload deepglobe train/ folder to Drive
+#         2) Set MODE in CELL 3
+#         3) Run cells top-to-bottom
+#
+#  If Colab disconnects: re-run CELLS 1,2,3,4,5,6,7,8 then 9 with
+#  RESUME=True. Best checkpoint is preserved on Drive.
+# ============================================================
+
+
+# ==== CELL 1 — Installs ====
+!nvidia-smi
+!pip install -q albumentations==1.3.1
+print("✅ Ready")
+
+
+# ==== CELL 2 — Mount Drive ====
+from google.colab import drive
+drive.mount('/content/drive')
+import os
+WORK = '/content/drive/MyDrive/road_extraction'
+os.makedirs(f'{WORK}/checkpoints', exist_ok=True)
+os.makedirs(f'{WORK}/predictions',  exist_ok=True)
+os.makedirs(f'{WORK}/logs',         exist_ok=True)
+print(f"✅ {WORK}")
+
+
+# ==== CELL 3 — CONFIG (edit then run all below) ====
+
+MODE   = "train"      # "train" or "predict"
+RESUME = False        # True after a disconnect to continue training
+
+DATASET_DIR = '/content/drive/MyDrive/deepglobe_road/train'
+
+IMG_SIZE      = 512   # random crop from 1024 source
+BATCH_SIZE    = 8
+NUM_EPOCHS    = 40
+LR            = 2e-4
+PATIENCE      = 8     # early stopping
+NUM_WORKERS   = 2
+
+BEST_CKPT = f'{WORK}/checkpoints/best_dlinknet34.pth'
+LAST_CKPT = f'{WORK}/checkpoints/last_dlinknet34.pth'
+LOG_CSV   = f'{WORK}/logs/training_log.csv'
+
+# Predict-mode
+INPUT_IMAGE    = '/content/drive/MyDrive/road_extraction/my_satellite.jpg'
+OUTPUT_MASK    = f'{WORK}/predictions/road_mask.png'
+OUTPUT_OVERLAY = f'{WORK}/predictions/road_overlay.png'
+
+print(f"MODE={MODE}  RESUME={RESUME}")
+
+
+# ==== CELL 4 — Imports ====
+import numpy as np, cv2, csv, time
+import torch, torch.nn as nn
+import torchvision.models as tvm
+from torch.utils.data import Dataset, DataLoader
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+from glob import glob
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f"Device: {DEVICE}")
+
+
+# ==== CELL 5 — D-LinkNet34 architecture (the DeepGlobe challenge winner) ====
+
+class DilatedCenter(nn.Module):
+    """Cascaded dilated conv block — the 'D' in D-LinkNet.
+    Captures multi-scale context essential for thin elongated roads."""
+    def __init__(self, ch):
+        super().__init__()
+        self.d1 = nn.Conv2d(ch, ch, 3, padding=1,  dilation=1)
+        self.d2 = nn.Conv2d(ch, ch, 3, padding=2,  dilation=2)
+        self.d4 = nn.Conv2d(ch, ch, 3, padding=4,  dilation=4)
+        self.d8 = nn.Conv2d(ch, ch, 3, padding=8,  dilation=8)
+        self.relu = nn.ReLU(inplace=True)
+    def forward(self, x):
+        a = self.relu(self.d1(x))
+        b = self.relu(self.d2(a))
+        c = self.relu(self.d4(b))
+        d = self.relu(self.d8(c))
+        return x + a + b + c + d
+
+
+class DecoderBlock(nn.Module):
+    """LinkNet decoder: 1x1 reduce → 3x3 transpose-conv upsample → 1x1 expand."""
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        mid = in_ch // 4
+        self.conv1   = nn.Conv2d(in_ch, mid, 1)
+        self.bn1     = nn.BatchNorm2d(mid)
+        self.deconv  = nn.ConvTranspose2d(mid, mid, 3, stride=2,
+                                          padding=1, output_padding=1)
+        self.bn2     = nn.BatchNorm2d(mid)
+        self.conv2   = nn.Conv2d(mid, out_ch, 1)
+        self.bn3     = nn.BatchNorm2d(out_ch)
+        self.relu    = nn.ReLU(inplace=True)
+    def forward(self, x):
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.relu(self.bn2(self.deconv(x)))
+        x = self.relu(self.bn3(self.conv2(x)))
+        return x
+
+
+class DLinkNet34(nn.Module):
+    def __init__(self, num_classes=1):
+        super().__init__()
+        r = tvm.resnet34(weights=tvm.ResNet34_Weights.IMAGENET1K_V1)
+        self.first = nn.Sequential(r.conv1, r.bn1, r.relu, r.maxpool)
+        self.e1, self.e2, self.e3, self.e4 = r.layer1, r.layer2, r.layer3, r.layer4
+        self.center = DilatedCenter(512)
+        self.d4 = DecoderBlock(512, 256)
+        self.d3 = DecoderBlock(256, 128)
+        self.d2 = DecoderBlock(128,  64)
+        self.d1 = DecoderBlock( 64,  64)
+        self.final = nn.Sequential(
+            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, num_classes, 3, padding=1),
+        )
+    def forward(self, x):
+        x  = self.first(x)
+        e1 = self.e1(x);  e2 = self.e2(e1)
+        e3 = self.e3(e2); e4 = self.e4(e3)
+        c  = self.center(e4)
+        d4 = self.d4(c)  + e3
+        d3 = self.d3(d4) + e2
+        d2 = self.d2(d3) + e1
+        d1 = self.d1(d2)
+        return self.final(d1)
+
+def build_model():
+    return DLinkNet34().to(DEVICE)
+
+
+# ==== CELL 6 — Dataset + Augmentations ====
+
+class DeepGlobeRoads(Dataset):
+    def __init__(self, imgs, masks, transform):
+        self.imgs, self.masks, self.tf = imgs, masks, transform
+    def __len__(self): return len(self.imgs)
+    def __getitem__(self, i):
+        im = cv2.cvtColor(cv2.imread(self.imgs[i]), cv2.COLOR_BGR2RGB)
+        mk = (cv2.imread(self.masks[i], cv2.IMREAD_GRAYSCALE) > 127).astype(np.float32)
+        a = self.tf(image=im, mask=mk)
+        return a['image'], a['mask'].unsqueeze(0)
+
+def train_tf():
+    return A.Compose([
+        A.RandomResizedCrop(IMG_SIZE, IMG_SIZE, scale=(0.4, 1.0)),
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
+        A.RandomRotate90(p=0.5),
+        A.ShiftScaleRotate(0.0625, 0.2, 45, p=0.5, border_mode=cv2.BORDER_REFLECT),
+        A.OneOf([
+            A.RandomBrightnessContrast(0.2, 0.2, p=1.0),
+            A.HueSaturationValue(15, 20, 15, p=1.0),
+            A.CLAHE(p=1.0),
+            A.RandomGamma((80, 120), p=1.0),
+        ], p=0.7),
+        A.OneOf([A.GaussNoise(p=1.0), A.GaussianBlur(p=1.0), A.MotionBlur(p=1.0)], p=0.2),
+        A.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ToTensorV2(),
+    ])
+
+def val_tf():
+    return A.Compose([
+        A.Resize(IMG_SIZE, IMG_SIZE),
+        A.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ToTensorV2(),
+    ])
+
+
+# ==== CELL 7 — Loss + Metrics ====
+
+class DiceBCELoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.bce = nn.BCEWithLogitsLoss()
+    def dice(self, p, t, eps=1e-7):
+        p = torch.sigmoid(p)
+        inter = (p * t).sum(dim=(1,2,3))
+        denom = p.sum(dim=(1,2,3)) + t.sum(dim=(1,2,3))
+        return 1 - ((2*inter + eps) / (denom + eps)).mean()
+    def forward(self, logits, target):
+        return 0.5 * self.dice(logits, target) + 0.5 * self.bce(logits, target)
+
+def metrics(logits, target, thr=0.5, eps=1e-7):
+    p = (torch.sigmoid(logits) > thr).float()
+    inter_r = (p * target).sum(dim=(1,2,3))
+    union_r = p.sum(dim=(1,2,3)) + target.sum(dim=(1,2,3)) - inter_r
+    riou = ((inter_r + eps) / (union_r + eps)).mean().item()
+    inter_b = ((1-p) * (1-target)).sum(dim=(1,2,3))
+    union_b = (1-p).sum(dim=(1,2,3)) + (1-target).sum(dim=(1,2,3)) - inter_b
+    biou = ((inter_b + eps) / (union_b + eps)).mean().item()
+    miou = (riou + biou) / 2
+    f1 = 2 * riou / (1 + riou + eps)
+    pacc = (p == target).float().mean().item()
+    return riou, miou, f1, pacc
+
+
+# ==== CELL 8 — Show model size ====
+m = build_model()
+n_params = sum(p.numel() for p in m.parameters()) / 1e6
+print(f"D-LinkNet34: {n_params:.1f}M params")
+del m; torch.cuda.empty_cache()
+
+
+# ==== CELL 9 — TRAIN ====
+if MODE == "train":
+    imgs  = sorted(glob(f'{DATASET_DIR}/*_sat.jpg'))
+    masks = [p.replace('_sat.jpg', '_mask.png') for p in imgs]
+    assert len(imgs) > 0, f"No images at {DATASET_DIR}"
+    print(f"Found {len(imgs)} pairs")
+
+    np.random.seed(42)
+    idx = np.random.permutation(len(imgs))
+    cut = int(0.9 * len(idx))
+    ti, vi = idx[:cut], idx[cut:]
+
+    tr_loader = DataLoader(
+        DeepGlobeRoads([imgs[i] for i in ti], [masks[i] for i in ti], train_tf()),
+        batch_size=BATCH_SIZE, shuffle=True,  num_workers=NUM_WORKERS, pin_memory=True)
+    va_loader = DataLoader(
+        DeepGlobeRoads([imgs[i] for i in vi], [masks[i] for i in vi], val_tf()),
+        batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+    print(f"Train {len(ti)} | Val {len(vi)}")
+
+    model     = build_model()
+    criterion = DiceBCELoss()
+    opt       = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-5)
+    sched     = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=NUM_EPOCHS)
+    scaler    = torch.cuda.amp.GradScaler()
+
+    start_epoch, best_iou, no_improve = 0, 0.0, 0
+
+    if RESUME and os.path.exists(LAST_CKPT):
+        ck = torch.load(LAST_CKPT, map_location=DEVICE)
+        model.load_state_dict(ck['model'])
+        opt.load_state_dict(ck['opt'])
+        sched.load_state_dict(ck['sched'])
+        start_epoch = ck['epoch'] + 1
+        best_iou    = ck['best']
+        no_improve  = ck.get('no_improve', 0)
+        print(f"⏯  Resuming epoch {start_epoch}, best={best_iou:.4f}")
+
+    if not os.path.exists(LOG_CSV) or not RESUME:
+        with open(LOG_CSV, 'w', newline='') as f:
+            csv.writer(f).writerow(['epoch','time_min','train_loss','val_loss',
+                                    'road_iou','mean_iou','f1','pixel_acc','lr'])
+
+    for epoch in range(start_epoch, NUM_EPOCHS):
+        t0 = time.time()
+        model.train(); tloss = 0
+        for im, mk in tqdm(tr_loader, desc=f'E{epoch+1}/{NUM_EPOCHS} train'):
+            im, mk = im.to(DEVICE), mk.to(DEVICE)
+            opt.zero_grad()
+            with torch.cuda.amp.autocast():
+                loss = criterion(model(im), mk)
+            scaler.scale(loss).backward()
+            scaler.step(opt); scaler.update()
+            tloss += loss.item()
+
+        model.eval()
+        vloss = riou = miou = f1 = pacc = 0
+        with torch.no_grad():
+            for im, mk in tqdm(va_loader, desc=f'E{epoch+1}/{NUM_EPOCHS} val'):
+                im, mk = im.to(DEVICE), mk.to(DEVICE)
+                with torch.cuda.amp.autocast():
+                    lg = model(im)
+                    vloss += criterion(lg, mk).item()
+                r, m_, f, p_ = metrics(lg, mk)
+                riou += r; miou += m_; f1 += f; pacc += p_
+
+        n = len(va_loader)
+        tloss /= len(tr_loader); vloss /= n
+        riou /= n; miou /= n; f1 /= n; pacc /= n
+        sched.step()
+        dt = (time.time() - t0) / 60
+        cur_lr = opt.param_groups[0]['lr']
+
+        print(f"E{epoch+1:02d} [{dt:.1f}min] | train {tloss:.4f} | val {vloss:.4f} "
+              f"| Road-IoU {riou:.4f} | mIoU {miou:.4f} | F1 {f1:.4f} | "
+              f"PixAcc {pacc:.4f} | lr {cur_lr:.2e}")
+
+        with open(LOG_CSV, 'a', newline='') as f:
+            csv.writer(f).writerow([epoch+1, f'{dt:.1f}', tloss, vloss,
+                                    riou, miou, f1, pacc, cur_lr])
+
+        improved = riou > best_iou
+        if improved:
+            best_iou = riou
+            no_improve = 0
+        else:
+            no_improve += 1
+
+        ck = {'model': model.state_dict(), 'opt': opt.state_dict(),
+              'sched': sched.state_dict(), 'epoch': epoch,
+              'best': best_iou, 'no_improve': no_improve}
+        torch.save(ck, LAST_CKPT)
+        if improved:
+            torch.save(ck, BEST_CKPT)
+            print(f"   ✅ new best Road-IoU={best_iou:.4f}")
+
+        if no_improve >= PATIENCE:
+            print(f"⛔ Early stop — no improvement for {PATIENCE} epochs")
+            break
+
+    print(f"\n🏁 Done. Best Road-IoU = {best_iou:.4f}")
+
+
+# ==== CELL 10 — PREDICT (sliding-window + 8× TTA + post-process) ====
+if MODE == "predict":
+    assert os.path.exists(BEST_CKPT), "Train first."
+    assert os.path.exists(INPUT_IMAGE), f"Missing: {INPUT_IMAGE}"
+
+    model = build_model()
+    ck = torch.load(BEST_CKPT, map_location=DEVICE)
+    model.load_state_dict(ck['model']); model.eval()
+    print(f"Loaded model — best Road-IoU at save: {ck['best']:.4f}")
+
+    img_bgr = cv2.imread(INPUT_IMAGE)
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    H, W = img_rgb.shape[:2]
+    print(f"Image: {W}x{H}")
+
+    PATCH, STRIDE = IMG_SIZE, IMG_SIZE // 2
+    pad_h = max(0, (PATCH - H % STRIDE) % STRIDE if H > PATCH else PATCH - H)
+    pad_w = max(0, (PATCH - W % STRIDE) % STRIDE if W > PATCH else PATCH - W)
+    img_p = cv2.copyMakeBorder(img_rgb, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
+    Hp, Wp = img_p.shape[:2]
+
+    hann = np.outer(np.hanning(PATCH), np.hanning(PATCH)).astype(np.float32) + 1e-3
+    prob = np.zeros((Hp, Wp), dtype=np.float32)
+    wt   = np.zeros((Hp, Wp), dtype=np.float32)
+    norm = A.Compose([A.Normalize([0.485,0.456,0.406], [0.229,0.224,0.225]),
+                      ToTensorV2()])
+
+    ys = sorted(set(list(range(0, Hp - PATCH + 1, STRIDE)) + [Hp - PATCH]))
+    xs = sorted(set(list(range(0, Wp - PATCH + 1, STRIDE)) + [Wp - PATCH]))
+
+    print(f"Patches: {len(ys) * len(xs)} × 8 TTA")
+    with torch.no_grad():
+        for y in tqdm(ys):
+            for x in xs:
+                t = norm(image=img_p[y:y+PATCH, x:x+PATCH])['image']\
+                    .unsqueeze(0).to(DEVICE)
+                preds = []
+                # 4 rotations × 2 flips = 8 TTA
+                for k in range(4):
+                    for flip in [False, True]:
+                        a = torch.rot90(t, k=k, dims=(2,3))
+                        if flip: a = torch.flip(a, dims=[3])
+                        with torch.cuda.amp.autocast():
+                            o = torch.sigmoid(model(a))
+                        if flip: o = torch.flip(o, dims=[3])
+                        o = torch.rot90(o, k=-k, dims=(2,3))
+                        preds.append(o)
+                p = torch.stack(preds).mean(0).squeeze().cpu().numpy()
+                prob[y:y+PATCH, x:x+PATCH] += p * hann
+                wt[y:y+PATCH, x:x+PATCH] += hann
+
+    prob = (prob / wt)[:H, :W]
+    binary = (prob > 0.5).astype(np.uint8) * 255
+
+    # ---- Post-processing: morphological close + remove small components ----
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
+    cleaned = np.zeros_like(binary)
+    for i in range(1, n_labels):
+        if stats[i, cv2.CC_STAT_AREA] >= 200:
+            cleaned[labels == i] = 255
+    binary = cleaned
+
+    cv2.imwrite(OUTPUT_MASK, binary)
+
+    overlay = img_bgr.copy()
+    red = np.zeros_like(overlay); red[:,:,2] = 255
+    m3 = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR) > 0
+    overlay = np.where(m3, cv2.addWeighted(overlay, 0.5, red, 0.5, 0), overlay)
+    cv2.imwrite(OUTPUT_OVERLAY, overlay)
+
+    fig, ax = plt.subplots(1, 3, figsize=(20, 7))
+    ax[0].imshow(img_rgb);             ax[0].set_title('Input')
+    ax[1].imshow(binary, cmap='gray'); ax[1].set_title('Predicted Roads')
+    ax[2].imshow(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)); ax[2].set_title('Overlay')
+    for a in ax: a.axis('off')
+    plt.tight_layout(); plt.show()
+
+    print(f"✅ Mask:    {OUTPUT_MASK}")
+    print(f"✅ Overlay: {OUTPUT_OVERLAY}")
